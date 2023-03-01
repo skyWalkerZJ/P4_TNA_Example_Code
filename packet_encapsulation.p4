@@ -450,12 +450,12 @@ control process_rewrite(inout headers hdr,
     inout ingress_intrinsic_metadata_for_tm_t        ig_tm_md
 )
 {
-    action inner_ipv4_rewrite() {
+    action inner_ipv4_encap() {
         user_md.l3_metadata.payload_length = hdr.ipv4.totalLen;
         user_md.tunnel.inner_ip_proto = IP_PROTOCOLS_IPV4;
     }
 
-    action inner_ipv6_rewrite() {
+    action inner_ipv6_encap() {
         
         /* 40 bytes is the length of the base IPv6 header, which is
          * not included in hdr.ipv6.payloadLen */
@@ -464,6 +464,23 @@ control process_rewrite(inout headers hdr,
         user_md.tunnel.inner_ip_proto = IP_PROTOCOLS_IPV6;
     }
 
+    action pre_ipv4_decap()
+    {
+        user_md.tunnel.inner_ip_proto = hdr.ipv4.protocol;
+    }
+
+    action pre_ipv6_decap()
+    {
+        user_md.tunnel.inner_ip_proto = hdr.ipv6.nextHdr;
+    }
+
+    action pre_gre_decap()
+    {
+        user_md.tunnel.inner_ip_proto = (bit<8>)hdr.gre.proto;
+        hdr.ethernet.etherType=hdr.gre.proto;
+    }
+
+
 
     table tunnel_encap_process_inner {
         key = {
@@ -471,13 +488,37 @@ control process_rewrite(inout headers hdr,
             hdr.ipv6.isValid(): exact;
         }
         actions = {
-            inner_ipv4_rewrite;
-            inner_ipv6_rewrite;
+            inner_ipv4_encap;
+            inner_ipv6_encap;
             NoAction;
         }
         size = 1024;
     }
 
+    table tunnel_decap_process_inner {
+        key = {
+            user_md.tunnel.ingress_tunnel_type:exact;
+            /*
+                ipv4      +ipv4
+                ipv4      +ipv6
+                ipv6      +ipv4
+                ipv6      +ipv6
+                ipv4+gre  +ipv4
+                ipv6+gre  +ipv4
+                ipv4+gre  +ipv6
+                ipv6+gre  +ipv6
+                three types tunnel,
+                we should recognize the inner proto through the proto_type of ipv4,ipv6,gre.
+            */
+        }
+        actions = {
+            pre_ipv4_decap;
+            pre_ipv6_decap;
+            pre_gre_decap;
+            NoAction;
+        }
+        size = 1024;
+    }
 
 
 
@@ -617,12 +658,67 @@ control process_rewrite(inout headers hdr,
         hdr.generic_40_byte_hdr.word9 = word9;
     }
 
+    action miss_ipv4_encap()
+    {
+        hdr.ipv4.setInvalid();
+    }
+    action miss_ipv6_encap()
+    {
+        hdr.ipv6.setInvalid();
+    }
+    action miss_gre_encap()
+    {
+        hdr.gre.setInvalid();   
+    }
+    action miss_ethernet_encap()
+    {
+        hdr.ethernet.setInvalid();
+    }
+    action ipv4_gre_decap()
+    {
+        //hdr.ethernet.etherType=(bit<16>)user_md.tunnel.inner_ip_proto;
+        miss_ipv4_encap();
+        miss_gre_encap();
+    }
+
+    action ipv4_decap()
+    {
+        hdr.ethernet.etherType=(bit<16>)user_md.tunnel.inner_ip_proto;
+        miss_ipv4_encap();
+    }
+
+    action ipv6_gre_decap()
+    {
+        // cast will cause problom
+        // hdr.ethernet.etherType=(bit<16>)user_md.tunnel.inner_ip_proto;
+        miss_ipv6_encap();
+        miss_gre_encap();
+    }
+
+    action ipv6_decap()
+    {
+        hdr.ethernet.etherType=(bit<16>)user_md.tunnel.inner_ip_proto;
+        miss_ipv6_encap();
+    }
+    action remove_generic_20_byte_header()
+    {
+        hdr.generic_20_byte_hdr.setInvalid();
+    }
+    action remove_generic_28_byte_header()
+    {
+        hdr.generic_28_byte_hdr.setInvalid();
+    }
+    action remove_generic_40_byte_header()
+    {
+        hdr.generic_40_byte_hdr.setInvalid();
+    }
     table tunnel_encap_process_outer {
         key = {
             user_md.tunnel.egress_tunnel_type : exact;
         }
         actions = {
             NoAction;
+
             ipv4_gre_encap;
             ipv4_ip_encap;
             ipv6_gre_encap;
@@ -630,6 +726,14 @@ control process_rewrite(inout headers hdr,
             add_generic_20_byte_header;
             add_generic_28_byte_header;
             add_generic_40_byte_header;
+            
+            ipv4_gre_decap;
+            ipv4_decap;
+            ipv6_gre_decap;
+            ipv6_decap;
+            remove_generic_20_byte_header;
+            remove_generic_28_byte_header;
+            remove_generic_40_byte_header;
         }
         size = 1024;
     }
@@ -690,16 +794,22 @@ control process_rewrite(inout headers hdr,
     }
 
     apply{
-        if(user_md.tunnel.egress_tunnel_type != EGRESS_TUNNEL_TYPE_NONE )
+
+        if(user_md.tunnel.egress_tunnel_type >0&& user_md.tunnel.egress_tunnel_type<20)
         {
+            //encapsulation
             tunnel_encap_process_inner.apply();
-            tunnel_encap_process_outer.apply();
-            tunnel_encap_rewrite.apply();
-            tunnel_src_rewrite.apply();
-            tunnel_dst_rewrite.apply();
-            tunnel_smac_rewrite.apply();
-            tunnel_dmac_rewrite.apply();
+        }else if(user_md.tunnel.egress_tunnel_type >20)
+        {
+            //Decapsulation
+            tunnel_decap_process_inner.apply();
         }
+        tunnel_encap_process_outer.apply();
+        tunnel_encap_rewrite.apply();
+        tunnel_src_rewrite.apply();
+        tunnel_dst_rewrite.apply();
+        tunnel_smac_rewrite.apply();
+        tunnel_dmac_rewrite.apply();
     }
 }
 
